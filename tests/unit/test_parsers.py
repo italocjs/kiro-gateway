@@ -1357,3 +1357,93 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+# ==================================================================================================
+# Tests for refusal events
+# ==================================================================================================
+
+class TestAwsEventStreamParserRefusal:
+    """
+    Tests for Kiro refusal events (stopDetails.refusal, stopReason CONTENT_FILTERED).
+    
+    Kiro sends only this event, with no content, when it blocks a response.
+    """
+    
+    def test_parses_refusal_event(self, aws_event_parser):
+        """
+        What it does: Parses a real Kiro refusal payload.
+        Goal: Ensure category, explanation and stop reason are extracted.
+        """
+        print("Setup: Real refusal payload from Kiro...")
+        chunk = b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}'
+        
+        print("Action: Feeding refusal...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Events: {events}")
+        assert events == [{
+            "type": "refusal",
+            "data": {
+                "category": "REASONING_EXTRACTION",
+                "explanation": "The selected model cannot continue this conversation.",
+                "stop_reason": "CONTENT_FILTERED",
+            }
+        }]
+        print("✓ Refusal parsed")
+    
+    def test_refusal_split_across_chunks(self, aws_event_parser):
+        """
+        What it does: Parses a refusal payload split across two chunks.
+        Goal: Ensure the parser waits for the complete JSON.
+        """
+        print("Setup: Splitting refusal payload...")
+        chunk = b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}'
+        
+        print("Action: Feeding two halves...")
+        first = aws_event_parser.feed(chunk[:40])
+        second = aws_event_parser.feed(chunk[40:])
+        
+        print(f"First: {first}, second: {second}")
+        assert first == []
+        assert len(second) == 1
+        assert second[0]["type"] == "refusal"
+        print("✓ Split refusal parsed")
+    
+    def test_stop_details_without_refusal_ignored(self, aws_event_parser):
+        """
+        What it does: Ignores stopDetails that carry no refusal.
+        Goal: Ensure unknown stop details do not produce a refusal.
+        """
+        print("Action: Feeding stopDetails without refusal...")
+        events = aws_event_parser.feed(b'{"stopDetails":{},"stopReason":"END_TURN"}')
+        
+        print(f"Events: {events}")
+        assert events == []
+        print("✓ Non-refusal stopDetails ignored")
+    
+    def test_refusal_with_missing_fields_uses_defaults(self, aws_event_parser):
+        """
+        What it does: Parses a refusal with no category or explanation.
+        Goal: Ensure defaults are used instead of failing.
+        """
+        print("Action: Feeding minimal refusal...")
+        events = aws_event_parser.feed(b'{"stopDetails":{"refusal":{}}}')
+        
+        print(f"Events: {events}")
+        assert events[0]["data"] == {"category": "UNKNOWN", "explanation": "", "stop_reason": ""}
+        print("✓ Defaults applied")
+    
+    def test_tool_stop_not_confused_with_refusal(self, aws_event_parser):
+        """
+        What it does: Keeps tool stop events working next to refusal parsing.
+        Goal: Ensure {"stop":true} is still a tool stop, not a refusal.
+        """
+        print("Setup: Complete tool call...")
+        aws_event_parser.feed(b'{"name":"func","toolUseId":"call_1"}')
+        events = aws_event_parser.feed(b'{"input":"{}"}{"stop":true}')
+        
+        print(f"Events: {events}, tool_calls: {aws_event_parser.tool_calls}")
+        assert events == []
+        assert len(aws_event_parser.tool_calls) == 1
+        print("✓ Tool stop unaffected")

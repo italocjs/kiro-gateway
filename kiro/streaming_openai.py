@@ -130,12 +130,17 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    refused = False  # Kiro blocked the response (finish_reason content_filter)
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
         async for event in parse_kiro_stream(response, first_token_timeout):
-            if event.type == "content" and event.content:
+            if event.type == "refusal":
+                # Shown to the client as content; finish_reason becomes "content_filter" below
+                refused = True
+            
+            if event.type in ("content", "refusal") and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
                 
@@ -298,8 +303,10 @@ async def stream_kiro_to_openai_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Determine finish_reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine finish_reason (refusal, then truncation, have highest priority)
+        if refused:
+            finish_reason = "content_filter"
+        elif content_was_truncated:
             finish_reason = "length"
         elif all_tool_calls:
             finish_reason = "tool_calls"

@@ -12,6 +12,7 @@ Tests for:
 - collect_stream_to_result() function
 - calculate_tokens_from_context_usage() function
 - with_keepalive() function
+- format_refusal_message() function and refusal events
 """
 
 import pytest
@@ -28,8 +29,10 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
     with_keepalive,
+    format_refusal_message,
     _process_chunk,
 )
+from kiro.parsers import AwsEventStreamParser
 
 
 # ==================================================================================================
@@ -2051,3 +2054,135 @@ class TestWithKeepalive:
         print(f"Real chunks: {real}")
         assert real == ["c0", "c1", "c2", "c3", "c4"]
         print("✓ Chunk order preserved")
+
+
+# ==================================================================================================
+# Tests for refusals
+# ==================================================================================================
+
+REFUSAL = {
+    "category": "REASONING_EXTRACTION",
+    "explanation": "The selected model cannot continue this conversation.",
+    "stop_reason": "CONTENT_FILTERED",
+}
+
+
+class TestFormatRefusalMessage:
+    """Tests for format_refusal_message() function."""
+    
+    def test_includes_category_and_explanation(self):
+        """
+        What it does: Builds a message with Kiro's category and explanation.
+        Goal: Verify the user sees why the response is empty.
+        """
+        print("Action: Formatting refusal with fake reasoning disabled...")
+        with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+            message = format_refusal_message(REFUSAL)
+        
+        print(f"Message: {message}")
+        assert "REASONING_EXTRACTION" in message
+        assert "cannot continue this conversation" in message
+        assert "FAKE_REASONING" not in message
+        print("✓ Message contains category and explanation")
+    
+    def test_hints_fake_reasoning_when_it_caused_refusal(self):
+        """
+        What it does: Adds a fix hint for REASONING_EXTRACTION while fake reasoning is on.
+        Goal: Verify the actionable fix is shown when the gateway caused the refusal.
+        """
+        print("Action: Formatting refusal with fake reasoning enabled...")
+        with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
+            message = format_refusal_message(REFUSAL)
+        
+        print(f"Message: {message}")
+        assert "FAKE_REASONING=false" in message
+        print("✓ Fix hint included")
+    
+    def test_no_hint_for_other_categories(self):
+        """
+        What it does: Omits the fake reasoning hint for other refusal categories.
+        Goal: Verify the hint is not shown when it would not help.
+        """
+        print("Action: Formatting a different refusal category...")
+        with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
+            message = format_refusal_message({"category": "OTHER", "explanation": "Blocked."})
+        
+        print(f"Message: {message}")
+        assert "OTHER" in message
+        assert "FAKE_REASONING" not in message
+        print("✓ No hint for other categories")
+    
+    def test_handles_missing_fields(self):
+        """
+        What it does: Formats a refusal with no category or explanation.
+        Goal: Verify a readable fallback message.
+        """
+        print("Action: Formatting empty refusal...")
+        message = format_refusal_message({})
+        
+        print(f"Message: {message}")
+        assert "UNKNOWN" in message
+        assert "blocked" in message.lower()
+        print("✓ Fallback message used")
+
+
+class TestRefusalEvents:
+    """Tests for refusal events through _process_chunk() and collect_stream_to_result()."""
+    
+    @pytest.mark.asyncio
+    async def test_process_chunk_yields_refusal_event(self):
+        """
+        What it does: Turns a raw Kiro refusal into a refusal KiroEvent with a message.
+        Goal: Verify formatters receive the refusal and its user-facing text.
+        """
+        print("Setup: Real parser and refusal payload...")
+        parser = AwsEventStreamParser()
+        
+        print("Action: Processing chunk...")
+        events = [e async for e in _process_chunk(parser, b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}', None)]
+        
+        print(f"Events: {events}")
+        assert len(events) == 1
+        assert events[0].type == "refusal"
+        assert events[0].refusal["category"] == "REASONING_EXTRACTION"
+        assert "Kiro refused this response" in events[0].content
+        print("✓ Refusal event yielded")
+    
+    @pytest.mark.asyncio
+    async def test_refusal_bypasses_thinking_parser(self):
+        """
+        What it does: Yields the refusal even when the thinking parser is active.
+        Goal: Verify the refusal text is not buffered as possible thinking content.
+        """
+        print("Setup: Parser with active thinking parser...")
+        parser = AwsEventStreamParser()
+        thinking_parser = MagicMock()
+        
+        print("Action: Processing chunk...")
+        events = [e async for e in _process_chunk(parser, b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}', thinking_parser)]
+        
+        print(f"Events: {[e.type for e in events]}")
+        assert [e.type for e in events] == ["refusal"]
+        thinking_parser.feed.assert_not_called()
+        print("✓ Thinking parser bypassed")
+    
+    @pytest.mark.asyncio
+    async def test_collect_stream_to_result_records_refusal(self, mock_response):
+        """
+        What it does: Stores the refusal and its message in StreamResult.
+        Goal: Verify non-streaming responses can report the refusal.
+        """
+        print("Setup: Stream with only a refusal...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="refusal", refusal=REFUSAL, content="Kiro refused this response")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Collecting result...")
+        with patch('kiro.streaming_core.parse_kiro_stream', mock_parse_kiro_stream):
+            result = await collect_stream_to_result(mock_response)
+        
+        print(f"Result: {result}")
+        assert result.refusal == REFUSAL
+        assert result.content == "Kiro refused this response"
+        print("✓ Refusal recorded")

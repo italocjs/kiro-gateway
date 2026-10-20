@@ -1749,3 +1749,102 @@ class TestStreamingAnthropicKeepalive:
         assert not any(c.startswith("event: ping") for c in chunks)
         assert any("tool_use" in c for c in chunks)
         print("✓ No ping events when disabled")
+
+
+# ==================================================================================================
+# Tests for refusals
+# ==================================================================================================
+
+class TestStreamingAnthropicRefusal:
+    """
+    Tests for Kiro refusals in the Anthropic API.
+    
+    Kiro can block a response and send no content. The client must see the refusal
+    (stop_reason "refusal" plus an explanation) instead of an empty end_turn.
+    """
+    
+    REFUSAL = {
+        "category": "REASONING_EXTRACTION",
+        "explanation": "The selected model cannot continue this conversation.",
+        "stop_reason": "CONTENT_FILTERED",
+    }
+    MESSAGE = "Kiro refused this response (REASONING_EXTRACTION): The selected model cannot continue this conversation."
+    
+    @pytest.mark.asyncio
+    async def test_streaming_refusal_sets_stop_reason_and_text(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a refusal as a text block with stop_reason "refusal".
+        Goal: Verify clients show the refusal instead of an empty answer.
+        """
+        print("Setup: Stream with only a refusal...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="refusal", refusal=self.REFUSAL, content=self.MESSAGE)
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Streaming to Anthropic format...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        events = [json.loads(c.split("data: ", 1)[1]) for c in chunks if "data: " in c]
+        text = "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta")
+        stop = [e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"]
+        print(f"Text: {text!r}, stop: {stop}")
+        assert text == self.MESSAGE
+        assert stop == ["refusal"]
+        print("✓ Refusal streamed")
+    
+    @pytest.mark.asyncio
+    async def test_streaming_without_refusal_keeps_end_turn(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Keeps stop_reason "end_turn" for a normal response.
+        Goal: Verify the refusal handling does not change normal responses.
+        """
+        print("Setup: Normal stream...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Yes.")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Streaming to Anthropic format...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        stop = [json.loads(c.split("data: ", 1)[1])["delta"]["stop_reason"] for c in chunks if c.startswith("event: message_delta")]
+        print(f"stop: {stop}")
+        assert stop == ["end_turn"]
+        print("✓ Normal stop reason kept")
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_refusal(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Returns stop_reason "refusal" with the explanation in non-streaming mode.
+        Goal: Verify streaming and non-streaming behave the same.
+        """
+        print("Setup: Stream result with a refusal...")
+        mock_result = StreamResult(
+            content=self.MESSAGE,
+            refusal=self.REFUSAL,
+            context_usage_percentage=1.0
+        )
+        
+        print("Action: Collecting Anthropic response...")
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            result = await collect_anthropic_response(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+            )
+        
+        print(f"Result: {result}")
+        assert result["stop_reason"] == "refusal"
+        assert result["content"][0]["text"] == self.MESSAGE
+        print("✓ Non-streaming refusal returned")

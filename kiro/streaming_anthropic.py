@@ -207,6 +207,9 @@ async def stream_kiro_to_anthropic(
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
     
+    # Refusal details if Kiro blocked the response
+    refusal: Optional[Dict[str, Any]] = None
+    
     try:
         # Send message_start event
         yield format_sse_event("message_start", {
@@ -227,7 +230,11 @@ async def stream_kiro_to_anthropic(
         })
         
         async for event in parse_kiro_stream(response, first_token_timeout):
-            if event.type == "content":
+            if event.type == "refusal":
+                # Shown to the client as text; stop_reason becomes "refusal" below
+                refusal = event.refusal
+            
+            if event.type in ("content", "refusal"):
                 content = event.content or ""
                 full_content += content
                 
@@ -640,8 +647,10 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
-        # Determine stop reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine stop reason (refusal, then truncation, have highest priority)
+        if refusal:
+            stop_reason = "refusal"
+        elif content_was_truncated:
             stop_reason = "max_tokens"
         elif tool_blocks:
             stop_reason = "tool_use"
@@ -837,8 +846,10 @@ async def collect_anthropic_response(
             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
         )
     
-    # Determine stop reason (truncation has highest priority)
-    if content_was_truncated:
+    # Determine stop reason (refusal, then truncation, have highest priority)
+    if result.refusal:
+        stop_reason = "refusal"
+    elif content_was_truncated:
         stop_reason = "max_tokens"
     elif result.tool_calls:
         stop_reason = "tool_use"

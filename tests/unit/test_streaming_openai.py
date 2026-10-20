@@ -1563,3 +1563,74 @@ class TestStreamingOpenaiKeepalive:
         assert OPENAI_KEEPALIVE_COMMENT not in chunks
         assert any("tool_calls" in c for c in chunks)
         print("✓ No keepalive comments when disabled")
+
+
+# ==================================================================================================
+# Tests for refusals
+# ==================================================================================================
+
+class TestStreamingOpenaiRefusal:
+    """
+    Tests for Kiro refusals in the OpenAI API.
+    
+    A refused response is reported with finish_reason "content_filter" and the
+    explanation as content, instead of an empty "stop".
+    """
+    
+    REFUSAL = {
+        "category": "REASONING_EXTRACTION",
+        "explanation": "The selected model cannot continue this conversation.",
+        "stop_reason": "CONTENT_FILTERED",
+    }
+    MESSAGE = "Kiro refused this response (REASONING_EXTRACTION): The selected model cannot continue this conversation."
+    
+    def _mock_stream(self):
+        refusal, message = self.REFUSAL, self.MESSAGE
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="refusal", refusal=refusal, content=message)
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        return mock_parse_kiro_stream
+    
+    @pytest.mark.asyncio
+    async def test_streaming_refusal_sets_content_filter(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a refusal as content with finish_reason "content_filter".
+        Goal: Verify OpenAI clients see the refusal.
+        """
+        print("Action: Streaming refusal to OpenAI format...")
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', self._mock_stream()):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        data = [json.loads(c[6:]) for c in chunks if c.startswith("data: {")]
+        content = "".join(d["choices"][0]["delta"].get("content", "") for d in data if d.get("choices"))
+        finish = [d["choices"][0]["finish_reason"] for d in data if d.get("choices") and d["choices"][0].get("finish_reason")]
+        print(f"Content: {content!r}, finish: {finish}")
+        assert content == self.MESSAGE
+        assert finish == ["content_filter"]
+        print("✓ Refusal streamed with content_filter")
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_refusal(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Returns finish_reason "content_filter" in non-streaming mode.
+        Goal: Verify streaming and non-streaming behave the same.
+        """
+        print("Action: Collecting refusal response...")
+        with patch('kiro.streaming_openai.parse_kiro_stream', self._mock_stream()):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                result = await collect_stream_response(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                )
+        
+        print(f"Result: {result}")
+        assert result["choices"][0]["finish_reason"] == "content_filter"
+        assert result["choices"][0]["message"]["content"] == self.MESSAGE
+        print("✓ Non-streaming refusal returned")
