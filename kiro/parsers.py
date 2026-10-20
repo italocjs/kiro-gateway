@@ -220,6 +220,7 @@ class AwsEventStreamParser:
     - tool_start: Start of tool call (name, toolUseId)
     - tool_input: Continuation of input for tool call
     - tool_stop: End of tool call
+    - refusal: Response blocked by Kiro (stopDetails.refusal, stopReason CONTENT_FILTERED)
     - usage: Credit consumption information
     - context_usage: Context usage percentage
     
@@ -243,6 +244,7 @@ class AwsEventStreamParser:
         ('{"name":', 'tool_start'),
         ('{"input":', 'tool_input'),
         ('{"stop":', 'tool_stop'),
+        ('{"stopDetails":', 'refusal'),
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
@@ -324,6 +326,8 @@ class AwsEventStreamParser:
             return self._process_tool_input_event(data)
         elif event_type == 'tool_stop':
             return self._process_tool_stop_event(data)
+        elif event_type == 'refusal':
+            return self._process_refusal_event(data)
         elif event_type == 'usage':
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
@@ -393,6 +397,35 @@ class AwsEventStreamParser:
                 input_str = str(input_data) if input_data else ''
             self.current_tool_call['function']['arguments'] += input_str
         return None
+    
+    def _process_refusal_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes a refusal (Kiro blocked the response).
+        
+        Kiro sends this instead of any content, e.g.:
+        {"stopDetails": {"refusal": {"category": "REASONING_EXTRACTION",
+        "explanation": "..."}}, "stopReason": "CONTENT_FILTERED"}
+        
+        Args:
+            data: Parsed JSON event
+        
+        Returns:
+            Refusal event with category, explanation and stop reason, or None if
+            the event has no refusal details
+        """
+        stop_details = data.get('stopDetails')
+        refusal = stop_details.get('refusal') if isinstance(stop_details, dict) else None
+        if not isinstance(refusal, dict):
+            return None
+        
+        return {
+            "type": "refusal",
+            "data": {
+                "category": refusal.get('category') or "UNKNOWN",
+                "explanation": refusal.get('explanation') or "",
+                "stop_reason": data.get('stopReason') or "",
+            }
+        }
     
     def _process_tool_stop_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes tool call end."""

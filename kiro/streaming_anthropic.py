@@ -46,10 +46,16 @@ from kiro.streaming_core import (
     KiroEvent,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
+    with_keepalive,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
-from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
+from kiro.config import (
+    FIRST_TOKEN_TIMEOUT,
+    FIRST_TOKEN_MAX_RETRIES,
+    FAKE_REASONING_HANDLING,
+    STREAM_KEEPALIVE_INTERVAL,
+)
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -201,6 +207,9 @@ async def stream_kiro_to_anthropic(
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
     
+    # Refusal details if Kiro blocked the response
+    refusal: Optional[Dict[str, Any]] = None
+    
     try:
         # Send message_start event
         yield format_sse_event("message_start", {
@@ -221,7 +230,11 @@ async def stream_kiro_to_anthropic(
         })
         
         async for event in parse_kiro_stream(response, first_token_timeout):
-            if event.type == "content":
+            if event.type == "refusal":
+                # Shown to the client as text; stop_reason becomes "refusal" below
+                refusal = event.refusal
+            
+            if event.type in ("content", "refusal"):
                 content = event.content or ""
                 full_content += content
                 
@@ -634,8 +647,10 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
-        # Determine stop reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine stop reason (refusal, then truncation, have highest priority)
+        if refusal:
+            stop_reason = "refusal"
+        elif content_was_truncated:
             stop_reason = "max_tokens"
         elif tool_blocks:
             stop_reason = "tool_use"
@@ -831,8 +846,10 @@ async def collect_anthropic_response(
             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
         )
     
-    # Determine stop reason (truncation has highest priority)
-    if content_was_truncated:
+    # Determine stop reason (refusal, then truncation, have highest priority)
+    if result.refusal:
+        stop_reason = "refusal"
+    elif content_was_truncated:
         stop_reason = "max_tokens"
     elif result.tool_calls:
         stop_reason = "tool_use"
@@ -873,7 +890,8 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    keepalive_interval: float = STREAM_KEEPALIVE_INTERVAL
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -896,6 +914,7 @@ async def stream_with_first_token_retry_anthropic(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         request_system: Original system prompt (for fallback token counting)
+        keepalive_interval: Seconds of silence before sending a `ping` event (0 disables)
     
     Yields:
         Strings in Anthropic SSE format
@@ -937,13 +956,20 @@ async def stream_with_first_token_retry_anthropic(
         ):
             yield chunk
     
-    async for chunk in stream_with_first_token_retry(
-        make_request=make_request,
-        stream_processor=stream_processor,
-        initial_response=initial_response,
-        max_retries=max_retries,
-        first_token_timeout=first_token_timeout,
-        on_http_error=create_http_error,
-        on_all_retries_failed=create_timeout_error,
+    # Anthropic's own keepalive: clients skip `ping` events
+    ping_event = format_sse_event("ping", {"type": "ping"})
+    
+    async for chunk in with_keepalive(
+        stream_with_first_token_retry(
+            make_request=make_request,
+            stream_processor=stream_processor,
+            initial_response=initial_response,
+            max_retries=max_retries,
+            first_token_timeout=first_token_timeout,
+            on_http_error=create_http_error,
+            on_all_retries_failed=create_timeout_error,
+        ),
+        ping_event,
+        keepalive_interval,
     ):
         yield chunk

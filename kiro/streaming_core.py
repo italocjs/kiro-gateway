@@ -41,6 +41,7 @@ from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, dedupli
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
+    STREAM_KEEPALIVE_INTERVAL,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
 )
@@ -68,10 +69,11 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
-        content: Text content (for content events)
+        type: Event type (content, thinking, tool_use, refusal, usage, context_usage, error)
+        content: Text content (for content events; user-facing message for refusal events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool use data (for tool_use events)
+        refusal: Refusal details from Kiro (for refusal events): category, explanation, stop_reason
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
@@ -81,6 +83,7 @@ class KiroEvent:
     content: Optional[str] = None
     thinking_content: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
+    refusal: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
@@ -96,12 +99,14 @@ class StreamResult:
         content: Full text content
         thinking_content: Full thinking/reasoning content
         tool_calls: List of tool calls
+        refusal: Refusal details if Kiro blocked the response, else None
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
     """
     content: str = ""
     thinking_content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    refusal: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
 
@@ -275,11 +280,52 @@ async def _process_chunk(
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
         
+        elif event["type"] == "refusal":
+            refusal = event["data"]
+            message = format_refusal_message(refusal)
+            logger.warning(
+                f"Kiro refused the response: category={refusal['category']}, "
+                f"stop_reason={refusal['stop_reason']}. {message}"
+            )
+            yield KiroEvent(type="refusal", refusal=refusal, content=message)
+        
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+
+
+# ==================================================================================================
+# Refusals
+# ==================================================================================================
+
+def format_refusal_message(refusal: Dict[str, Any]) -> str:
+    """
+    Build the user-facing message for a response Kiro refused to generate.
+    
+    Kiro answers some requests with only a refusal and no content. Passing that on as
+    an empty response leaves clients showing nothing (Claude Code then nudges the model
+    for "no visible output" and loops), so the refusal is surfaced as text instead.
+    
+    Args:
+        refusal: Refusal details with category, explanation and stop_reason
+    
+    Returns:
+        Message explaining the refusal, with a fix hint when the gateway caused it
+    """
+    category = refusal.get("category") or "UNKNOWN"
+    explanation = refusal.get("explanation") or "The response was blocked."
+    message = f"Kiro refused this response ({category}): {explanation}"
+    
+    # The fake reasoning tags injected by this gateway trigger this category
+    if category == "REASONING_EXTRACTION" and FAKE_REASONING_ENABLED:
+        message += (
+            " This is triggered by the gateway's fake reasoning prompt."
+            " Set FAKE_REASONING=false to fix it."
+        )
+    
+    return message
 
 
 # ==================================================================================================
@@ -317,6 +363,9 @@ async def collect_stream_to_result(
             full_content_for_bracket_tools += event.thinking_content
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
+        elif event.type == "refusal" and event.refusal:
+            result.refusal = event.refusal
+            result.content += event.content or ""
         elif event.type == "usage" and event.usage:
             result.usage = event.usage
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
@@ -503,3 +552,72 @@ async def stream_with_first_token_retry(
             f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. "
             "Please try again."
         )
+
+
+# ==================================================================================================
+# Client Keepalive
+# ==================================================================================================
+
+async def with_keepalive(
+    source: AsyncGenerator[str, None],
+    keepalive_chunk: str,
+    interval: float = STREAM_KEEPALIVE_INTERVAL,
+) -> AsyncGenerator[str, None]:
+    """
+    Pass chunks through, inserting a keepalive chunk while the source is silent.
+    
+    Tool calls are only emitted once Kiro has finished the whole response, so a large
+    tool input leaves the client without any bytes for minutes. Clients with an
+    idle-stream watchdog treat that as a dead connection and abort. This wrapper sends
+    keepalive_chunk every `interval` seconds of silence so the connection stays alive.
+    
+    Keepalives start only after the first real chunk, so error responses raised before
+    the stream starts (HTTP errors, first token timeout) are unchanged.
+    
+    Args:
+        source: Async generator of SSE strings
+        keepalive_chunk: SSE string to send during silence (must be ignored by clients)
+        interval: Seconds of silence before each keepalive. 0 or less disables keepalives.
+    
+    Yields:
+        Chunks from source, with keepalive chunks inserted during silence
+    
+    Raises:
+        Any exception raised by source
+    """
+    iterator = source.__aiter__()
+    pending: Optional[asyncio.Future] = None
+    started = False
+    
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            
+            timeout = interval if (started and interval > 0) else None
+            done, _ = await asyncio.wait({pending}, timeout=timeout)
+            
+            if not done:
+                logger.debug(f"Stream silent for {interval}s, sending keepalive")
+                yield keepalive_chunk
+                continue
+            
+            task, pending = pending, None
+            try:
+                chunk = task.result()
+            except StopAsyncIteration:
+                return
+            
+            started = True
+            yield chunk
+    finally:
+        # Client disconnected or source finished: stop the in-flight read and close the source
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                pass
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()

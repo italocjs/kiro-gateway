@@ -11,6 +11,8 @@ Tests for:
 - parse_kiro_stream() function
 - collect_stream_to_result() function
 - calculate_tokens_from_context_usage() function
+- with_keepalive() function
+- format_refusal_message() function and refusal events
 """
 
 import pytest
@@ -26,8 +28,11 @@ from kiro.streaming_core import (
     collect_stream_to_result,
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
+    with_keepalive,
+    format_refusal_message,
     _process_chunk,
 )
+from kiro.parsers import AwsEventStreamParser
 
 
 # ==================================================================================================
@@ -1832,3 +1837,352 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+# ==================================================================================================
+# Tests for with_keepalive()
+# ==================================================================================================
+
+KEEPALIVE = "KEEPALIVE"
+
+
+class TestWithKeepalive:
+    """
+    Tests for with_keepalive() function.
+    
+    Tool calls are buffered until Kiro finishes the response, so the client can go
+    minutes without data. with_keepalive() inserts a keepalive chunk during silence
+    so clients with an idle-stream watchdog do not abort the request.
+    """
+    
+    @pytest.mark.asyncio
+    async def test_passes_chunks_through_when_source_is_fast(self):
+        """
+        What it does: Passes chunks unchanged when the source never goes silent.
+        Goal: Verify no keepalive is added to a normal stream.
+        """
+        print("Setup: Fast source with three chunks...")
+        
+        async def source():
+            yield "a"
+            yield "b"
+            yield "c"
+        
+        print("Action: Wrapping with interval=1.0...")
+        chunks = [c async for c in with_keepalive(source(), KEEPALIVE, 1.0)]
+        
+        print(f"Received: {chunks}")
+        assert chunks == ["a", "b", "c"]
+        print("✓ Chunks passed through unchanged")
+    
+    @pytest.mark.asyncio
+    async def test_inserts_keepalive_during_silence(self):
+        """
+        What it does: Sends keepalive chunks while the source is silent after the first chunk.
+        Goal: Verify the client keeps receiving data during a long buffered tool call.
+        """
+        print("Setup: Source that is silent for 0.35s between chunks...")
+        
+        async def source():
+            yield "message_start"
+            await asyncio.sleep(0.35)
+            yield "tool_use"
+        
+        print("Action: Wrapping with interval=0.1...")
+        chunks = [c async for c in with_keepalive(source(), KEEPALIVE, 0.1)]
+        
+        print(f"Received: {chunks}")
+        assert chunks[0] == "message_start"
+        assert chunks[-1] == "tool_use"
+        keepalives = chunks[1:-1]
+        assert len(keepalives) >= 2
+        assert all(c == KEEPALIVE for c in keepalives)
+        print("✓ Keepalives inserted during silence")
+    
+    @pytest.mark.asyncio
+    async def test_no_keepalive_before_first_chunk(self):
+        """
+        What it does: Does not send keepalives before the source yields its first chunk.
+        Goal: Verify errors raised before the stream starts are not preceded by keepalives.
+        """
+        print("Setup: Source that waits 0.3s before its first chunk...")
+        
+        async def source():
+            await asyncio.sleep(0.3)
+            yield "first"
+        
+        print("Action: Wrapping with interval=0.05...")
+        chunks = [c async for c in with_keepalive(source(), KEEPALIVE, 0.05)]
+        
+        print(f"Received: {chunks}")
+        assert chunks == ["first"]
+        print("✓ No keepalive before first chunk")
+    
+    @pytest.mark.asyncio
+    async def test_zero_interval_disables_keepalive(self):
+        """
+        What it does: Sends no keepalives when interval is 0.
+        Goal: Verify STREAM_KEEPALIVE_INTERVAL=0 disables the feature.
+        """
+        print("Setup: Source with silence after first chunk...")
+        
+        async def source():
+            yield "a"
+            await asyncio.sleep(0.2)
+            yield "b"
+        
+        print("Action: Wrapping with interval=0...")
+        chunks = [c async for c in with_keepalive(source(), KEEPALIVE, 0)]
+        
+        print(f"Received: {chunks}")
+        assert chunks == ["a", "b"]
+        print("✓ Keepalive disabled with interval=0")
+    
+    @pytest.mark.asyncio
+    async def test_empty_source_yields_nothing(self):
+        """
+        What it does: Finishes cleanly for a source with no chunks.
+        Goal: Verify edge case of an empty stream.
+        """
+        print("Setup: Empty source...")
+        
+        async def source():
+            return
+            yield  # pragma: no cover
+        
+        print("Action: Wrapping empty source...")
+        chunks = [c async for c in with_keepalive(source(), KEEPALIVE, 0.05)]
+        
+        print(f"Received: {chunks}")
+        assert chunks == []
+        print("✓ Empty source handled")
+    
+    @pytest.mark.asyncio
+    async def test_propagates_error_before_first_chunk(self):
+        """
+        What it does: Re-raises an exception raised before the first chunk.
+        Goal: Verify upstream errors (e.g. all first-token retries failed) still reach the route.
+        """
+        print("Setup: Source that raises immediately...")
+        
+        async def source():
+            raise ValueError("upstream failed")
+            yield  # pragma: no cover
+        
+        print("Action: Consuming wrapped source...")
+        chunks = []
+        with pytest.raises(ValueError, match="upstream failed"):
+            async for c in with_keepalive(source(), KEEPALIVE, 0.05):
+                chunks.append(c)
+        
+        assert chunks == []
+        print("✓ Error before first chunk propagated without keepalive")
+    
+    @pytest.mark.asyncio
+    async def test_propagates_error_mid_stream(self):
+        """
+        What it does: Re-raises an exception raised after silence mid-stream.
+        Goal: Verify keepalives do not swallow stream errors.
+        """
+        print("Setup: Source that fails after a silent period...")
+        
+        async def source():
+            yield "a"
+            await asyncio.sleep(0.15)
+            raise RuntimeError("stream broke")
+        
+        print("Action: Consuming wrapped source...")
+        chunks = []
+        with pytest.raises(RuntimeError, match="stream broke"):
+            async for c in with_keepalive(source(), KEEPALIVE, 0.05):
+                chunks.append(c)
+        
+        print(f"Received before error: {chunks}")
+        assert chunks[0] == "a"
+        assert KEEPALIVE in chunks
+        print("✓ Mid-stream error propagated")
+    
+    @pytest.mark.asyncio
+    async def test_closes_source_when_client_disconnects(self):
+        """
+        What it does: Closes the source when the consumer stops during silence.
+        Goal: Verify a client disconnect cancels the pending read and closes the upstream stream.
+        """
+        print("Setup: Source that tracks whether it was closed...")
+        
+        closed = False
+        
+        async def source():
+            nonlocal closed
+            try:
+                yield "a"
+                await asyncio.sleep(10)
+                yield "never"
+            finally:
+                closed = True
+        
+        print("Action: Reading first chunk and one keepalive, then closing...")
+        wrapped = with_keepalive(source(), KEEPALIVE, 0.05)
+        first = await wrapped.__anext__()
+        second = await wrapped.__anext__()
+        await wrapped.aclose()
+        
+        print(f"Received: {[first, second]}, closed={closed}")
+        assert first == "a"
+        assert second == KEEPALIVE
+        assert closed is True
+        print("✓ Source closed on client disconnect")
+    
+    @pytest.mark.asyncio
+    async def test_keeps_chunk_order(self):
+        """
+        What it does: Keeps the original order of chunks around keepalives.
+        Goal: Verify keepalives never reorder or drop real chunks.
+        """
+        print("Setup: Source with alternating fast and slow chunks...")
+        
+        async def source():
+            for i in range(5):
+                if i % 2:
+                    await asyncio.sleep(0.12)
+                yield f"c{i}"
+        
+        print("Action: Wrapping with interval=0.05...")
+        chunks = [c async for c in with_keepalive(source(), KEEPALIVE, 0.05)]
+        real = [c for c in chunks if c != KEEPALIVE]
+        
+        print(f"Real chunks: {real}")
+        assert real == ["c0", "c1", "c2", "c3", "c4"]
+        print("✓ Chunk order preserved")
+
+
+# ==================================================================================================
+# Tests for refusals
+# ==================================================================================================
+
+REFUSAL = {
+    "category": "REASONING_EXTRACTION",
+    "explanation": "The selected model cannot continue this conversation.",
+    "stop_reason": "CONTENT_FILTERED",
+}
+
+
+class TestFormatRefusalMessage:
+    """Tests for format_refusal_message() function."""
+    
+    def test_includes_category_and_explanation(self):
+        """
+        What it does: Builds a message with Kiro's category and explanation.
+        Goal: Verify the user sees why the response is empty.
+        """
+        print("Action: Formatting refusal with fake reasoning disabled...")
+        with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+            message = format_refusal_message(REFUSAL)
+        
+        print(f"Message: {message}")
+        assert "REASONING_EXTRACTION" in message
+        assert "cannot continue this conversation" in message
+        assert "FAKE_REASONING" not in message
+        print("✓ Message contains category and explanation")
+    
+    def test_hints_fake_reasoning_when_it_caused_refusal(self):
+        """
+        What it does: Adds a fix hint for REASONING_EXTRACTION while fake reasoning is on.
+        Goal: Verify the actionable fix is shown when the gateway caused the refusal.
+        """
+        print("Action: Formatting refusal with fake reasoning enabled...")
+        with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
+            message = format_refusal_message(REFUSAL)
+        
+        print(f"Message: {message}")
+        assert "FAKE_REASONING=false" in message
+        print("✓ Fix hint included")
+    
+    def test_no_hint_for_other_categories(self):
+        """
+        What it does: Omits the fake reasoning hint for other refusal categories.
+        Goal: Verify the hint is not shown when it would not help.
+        """
+        print("Action: Formatting a different refusal category...")
+        with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', True):
+            message = format_refusal_message({"category": "OTHER", "explanation": "Blocked."})
+        
+        print(f"Message: {message}")
+        assert "OTHER" in message
+        assert "FAKE_REASONING" not in message
+        print("✓ No hint for other categories")
+    
+    def test_handles_missing_fields(self):
+        """
+        What it does: Formats a refusal with no category or explanation.
+        Goal: Verify a readable fallback message.
+        """
+        print("Action: Formatting empty refusal...")
+        message = format_refusal_message({})
+        
+        print(f"Message: {message}")
+        assert "UNKNOWN" in message
+        assert "blocked" in message.lower()
+        print("✓ Fallback message used")
+
+
+class TestRefusalEvents:
+    """Tests for refusal events through _process_chunk() and collect_stream_to_result()."""
+    
+    @pytest.mark.asyncio
+    async def test_process_chunk_yields_refusal_event(self):
+        """
+        What it does: Turns a raw Kiro refusal into a refusal KiroEvent with a message.
+        Goal: Verify formatters receive the refusal and its user-facing text.
+        """
+        print("Setup: Real parser and refusal payload...")
+        parser = AwsEventStreamParser()
+        
+        print("Action: Processing chunk...")
+        events = [e async for e in _process_chunk(parser, b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}', None)]
+        
+        print(f"Events: {events}")
+        assert len(events) == 1
+        assert events[0].type == "refusal"
+        assert events[0].refusal["category"] == "REASONING_EXTRACTION"
+        assert "Kiro refused this response" in events[0].content
+        print("✓ Refusal event yielded")
+    
+    @pytest.mark.asyncio
+    async def test_refusal_bypasses_thinking_parser(self):
+        """
+        What it does: Yields the refusal even when the thinking parser is active.
+        Goal: Verify the refusal text is not buffered as possible thinking content.
+        """
+        print("Setup: Parser with active thinking parser...")
+        parser = AwsEventStreamParser()
+        thinking_parser = MagicMock()
+        
+        print("Action: Processing chunk...")
+        events = [e async for e in _process_chunk(parser, b'{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}', thinking_parser)]
+        
+        print(f"Events: {[e.type for e in events]}")
+        assert [e.type for e in events] == ["refusal"]
+        thinking_parser.feed.assert_not_called()
+        print("✓ Thinking parser bypassed")
+    
+    @pytest.mark.asyncio
+    async def test_collect_stream_to_result_records_refusal(self, mock_response):
+        """
+        What it does: Stores the refusal and its message in StreamResult.
+        Goal: Verify non-streaming responses can report the refusal.
+        """
+        print("Setup: Stream with only a refusal...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="refusal", refusal=REFUSAL, content="Kiro refused this response")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Collecting result...")
+        with patch('kiro.streaming_core.parse_kiro_stream', mock_parse_kiro_stream):
+            result = await collect_stream_to_result(mock_response)
+        
+        print(f"Result: {result}")
+        assert result.refusal == REFUSAL
+        assert result.content == "Kiro refused this response"
+        print("✓ Refusal recorded")

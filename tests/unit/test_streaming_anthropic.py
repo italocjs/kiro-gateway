@@ -14,6 +14,7 @@ Tests for:
 import pytest
 import json
 import uuid
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro.streaming_anthropic import (
@@ -1667,3 +1668,183 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+# ==================================================================================================
+# Tests for client keepalive
+# ==================================================================================================
+
+class TestStreamingAnthropicKeepalive:
+    """
+    Tests for the `ping` keepalive in stream_with_first_token_retry_anthropic().
+    
+    Tool calls are emitted only after Kiro finishes, so the stream can be silent for
+    minutes. Anthropic `ping` events keep idle-stream watchdogs (e.g. Claude Code) from
+    aborting the request.
+    """
+    
+    @staticmethod
+    def _slow_tool_stream():
+        """Build a parse_kiro_stream mock that pauses before emitting a tool call."""
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Writing file")
+            await asyncio.sleep(0.3)
+            yield KiroEvent(type="tool_use", tool_use={
+                "id": "toolu_1",
+                "function": {"name": "write_file", "arguments": '{"path": "a.txt"}'}
+            })
+        return mock_parse_kiro_stream
+    
+    async def _collect(self, mock_model_cache, mock_auth_manager, keepalive_interval):
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_response.aclose = AsyncMock()
+        
+        async def mock_make_request():
+            return mock_response
+        
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', self._slow_tool_stream()):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_with_first_token_retry_anthropic(
+                    make_request=mock_make_request,
+                    model="claude-sonnet-4",
+                    model_cache=mock_model_cache,
+                    auth_manager=mock_auth_manager,
+                    max_retries=1,
+                    first_token_timeout=30,
+                    keepalive_interval=keepalive_interval
+                ):
+                    chunks.append(chunk)
+        return chunks
+    
+    @pytest.mark.asyncio
+    async def test_sends_ping_events_while_tool_call_is_buffered(self, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits `ping` events while the stream is silent.
+        Goal: Verify Anthropic clients keep receiving bytes during a long tool call.
+        """
+        print("Action: Streaming with keepalive_interval=0.1...")
+        chunks = await self._collect(mock_model_cache, mock_auth_manager, 0.1)
+        
+        pings = [c for c in chunks if c.startswith("event: ping")]
+        print(f"Received {len(chunks)} chunks, {len(pings)} pings")
+        assert len(pings) >= 2
+        assert all('"type": "ping"' in p for p in pings)
+        assert chunks[0].startswith("event: message_start")
+        assert any("tool_use" in c for c in chunks)
+        assert chunks[-1].startswith("event: message_stop")
+        print("✓ Ping events sent during silence")
+    
+    @pytest.mark.asyncio
+    async def test_no_ping_when_disabled(self, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Sends no `ping` events when keepalive_interval is 0.
+        Goal: Verify the keepalive can be disabled.
+        """
+        print("Action: Streaming with keepalive_interval=0...")
+        chunks = await self._collect(mock_model_cache, mock_auth_manager, 0)
+        
+        print(f"Received {len(chunks)} chunks")
+        assert not any(c.startswith("event: ping") for c in chunks)
+        assert any("tool_use" in c for c in chunks)
+        print("✓ No ping events when disabled")
+
+
+# ==================================================================================================
+# Tests for refusals
+# ==================================================================================================
+
+class TestStreamingAnthropicRefusal:
+    """
+    Tests for Kiro refusals in the Anthropic API.
+    
+    Kiro can block a response and send no content. The client must see the refusal
+    (stop_reason "refusal" plus an explanation) instead of an empty end_turn.
+    """
+    
+    REFUSAL = {
+        "category": "REASONING_EXTRACTION",
+        "explanation": "The selected model cannot continue this conversation.",
+        "stop_reason": "CONTENT_FILTERED",
+    }
+    MESSAGE = "Kiro refused this response (REASONING_EXTRACTION): The selected model cannot continue this conversation."
+    
+    @pytest.mark.asyncio
+    async def test_streaming_refusal_sets_stop_reason_and_text(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a refusal as a text block with stop_reason "refusal".
+        Goal: Verify clients show the refusal instead of an empty answer.
+        """
+        print("Setup: Stream with only a refusal...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="refusal", refusal=self.REFUSAL, content=self.MESSAGE)
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Streaming to Anthropic format...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        events = [json.loads(c.split("data: ", 1)[1]) for c in chunks if "data: " in c]
+        text = "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta")
+        stop = [e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"]
+        print(f"Text: {text!r}, stop: {stop}")
+        assert text == self.MESSAGE
+        assert stop == ["refusal"]
+        print("✓ Refusal streamed")
+    
+    @pytest.mark.asyncio
+    async def test_streaming_without_refusal_keeps_end_turn(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Keeps stop_reason "end_turn" for a normal response.
+        Goal: Verify the refusal handling does not change normal responses.
+        """
+        print("Setup: Normal stream...")
+        
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Yes.")
+            yield KiroEvent(type="context_usage", context_usage_percentage=1.0)
+        
+        print("Action: Streaming to Anthropic format...")
+        chunks = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+        
+        stop = [json.loads(c.split("data: ", 1)[1])["delta"]["stop_reason"] for c in chunks if c.startswith("event: message_delta")]
+        print(f"stop: {stop}")
+        assert stop == ["end_turn"]
+        print("✓ Normal stop reason kept")
+    
+    @pytest.mark.asyncio
+    async def test_non_streaming_refusal(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Returns stop_reason "refusal" with the explanation in non-streaming mode.
+        Goal: Verify streaming and non-streaming behave the same.
+        """
+        print("Setup: Stream result with a refusal...")
+        mock_result = StreamResult(
+            content=self.MESSAGE,
+            refusal=self.REFUSAL,
+            context_usage_percentage=1.0
+        )
+        
+        print("Action: Collecting Anthropic response...")
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            result = await collect_anthropic_response(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+            )
+        
+        print(f"Result: {result}")
+        assert result["stop_reason"] == "refusal"
+        assert result["content"][0]["text"] == self.MESSAGE
+        print("✓ Non-streaming refusal returned")
